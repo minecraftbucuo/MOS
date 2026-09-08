@@ -1,0 +1,16 @@
+# cargo 每次编译 kernel 时自动带上这里的配置，
+# 免得命令行敲一长串参数
+
+[build]
+# 编译目标：x86_64 裸机目标（无操作系统、无标准库）。
+# 这是官方维护的目标，core 核心库有预编译版本，stable 工具链就能用
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+rustflags = [
+    # 用我们自己的链接脚本（图纸）来链接
+    "-C", "link-arg=-Tlinker.ld",
+    # 静态重定位模型：内核地址在链接时就定死，不做位置无关（pie）。
+    # 该目标默认 pie，是给普通用户程序准备的，内核用不着
+    "-C", "relocation-model=static",
+]

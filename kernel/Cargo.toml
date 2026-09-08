@@ -1,0 +1,12 @@
+[package]
+name = "mos-kernel"
+version = "0.1.0"
+edition = "2021"
+
+# 内核不支持栈展开（unwind 需要操作系统配合），
+# panic 时直接停止，不走展开流程
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

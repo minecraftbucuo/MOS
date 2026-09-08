@@ -1,0 +1,12 @@
+# Rust 编译产物
+target/
+
+# 制作的 ISO 镜像
+*.iso
+
+# limine 二进制目录（构建时下载）
+kernel/limine/
+
+# 编辑器
+.idea/
+.vscode/
