@@ -6,6 +6,8 @@
 use core::arch::naked_asm;
 use core::panic::PanicInfo;
 
+mod serial;
+
 /// 内核启动栈。
 /// #[repr(align(16))]: x86-64 ABI 要求栈按 16 字节对齐，否则
 /// 某些指令（如 SSE 的 movaps）会触发对齐错误——这是裸机开发
@@ -49,9 +51,14 @@ pub extern "C" fn _start() -> ! {
     );
 }
 
-/// Rust 世界的入口。目前什么都不做，下一课在这里点亮串口。
+/// Rust 世界的入口。第一件事：让内核开口说话。
 #[no_mangle]
 pub extern "C" fn kmain() -> ! {
+    let mut com1 = serial::SerialPort::new(serial::SerialPort::COM1);
+    com1.init();
+    com1.send_str("\n=== MOS booting ===\n");
+    com1.send_str("hello from kernel!\n");
+
     loop {
         core::hint::spin_loop();
     }
