@@ -6,7 +6,16 @@
 use core::arch::naked_asm;
 use core::panic::PanicInfo;
 
+mod boot;
 mod serial;
+
+/// 贴在 .limine_requests 节区里的"需求单"。
+///
+/// #[used]：告诉编译器"这个 static 没人用也要保留"（防止被删）；
+/// 链接脚本里还有 KEEP 双保险。
+#[used]
+#[link_section = ".limine_requests"]
+static FRAMEBUFFER_REQUEST: boot::FramebufferRequest = boot::FramebufferRequest::new();
 
 /// 内核启动栈。
 /// #[repr(align(16))]: x86-64 ABI 要求栈按 16 字节对齐，否则
@@ -51,16 +60,51 @@ pub extern "C" fn _start() -> ! {
     );
 }
 
-/// Rust 世界的入口。第一件事：让内核开口说话。
+/// Rust 世界的入口。先让串口说话，再向 Limine 领屏幕。
 #[no_mangle]
 pub extern "C" fn kmain() -> ! {
     let mut com1 = serial::SerialPort::new(serial::SerialPort::COM1);
     com1.init();
     com1.send_str("\n=== MOS booting ===\n");
-    com1.send_str("hello from kernel!\n");
+
+    match FRAMEBUFFER_REQUEST.response() {
+        Some(resp) if !resp.framebuffers().is_empty() => {
+            let fb = resp.framebuffers()[0];
+            com1.send_str("framebuffer acquired\n");
+            draw_test_pattern(fb);
+            com1.send_str("test pattern drawn\n");
+        }
+        _ => {
+            com1.send_str("no framebuffer!\n");
+        }
+    }
 
     loop {
         core::hint::spin_loop();
+    }
+}
+
+/// 往屏幕上画测试图：红绿双色渐变，一眼就能看出"画对了没有"。
+fn draw_test_pattern(fb: &boot::Framebuffer) {
+    let width = fb.width as usize;
+    let height = fb.height as usize;
+    let pitch = fb.pitch as usize;
+    let base = fb.address();
+
+    for y in 0..height {
+        for x in 0..width {
+            // x 越右越红，y 越下越绿，蓝固定 —— 出来是张漂亮的渐变
+            let r = ((x * 255) / (width - 1)) as u32;
+            let g = ((y * 255) / (height - 1)) as u32;
+            let pixel = (r << 16) | (g << 8) | 0x40;
+
+            unsafe {
+                // 像素 (x, y) 的地址 = 基址 + 行距×y + 4字节×x
+                // write_volatile：这块显存没人跟编译器打招呼，别让它优化掉
+                let p = base.add(y * pitch + x * 4) as *mut u32;
+                p.write_volatile(pixel);
+            }
+        }
     }
 }
 

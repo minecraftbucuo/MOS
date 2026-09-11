@@ -18,6 +18,14 @@ SECTIONS
        后面所有节从这个虚拟地址开始排布 */
     . = KERNEL_BASE;
 
+    /* Limine 请求标记区：内核的"需求单"贴在这里（main.rs 的
+       #[link_section]），Limine 加载内核时扫描整个 ELF 找这个节。
+       KEEP 防止链接器把"没人使用"的需求单当死代码删掉 */
+    .limine_requests : {
+        KEEP(*(.limine_requests))
+        KEEP(*(.limine_requests.*))
+    }
+
     /* 代码段：第一个放 .text.entry（内核入口），保证它在最前面 */
     .text : ALIGN(4K) {
         KEEP(*(.text.entry))   /* KEEP: 防止链接器以为没人用而把它删掉 */
