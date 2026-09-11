@@ -20,7 +20,7 @@ mod serial;
 /// #[used]：告诉编译器"这个 static 没人用也要保留"（防止被删）；
 /// 链接脚本里还有 KEEP 双保险。
 #[used]
-#[link_section = ".limine_requests"]
+#[unsafe(link_section = ".limine_requests")]
 static FRAMEBUFFER_REQUEST: boot::FramebufferRequest = boot::FramebufferRequest::new();
 
 /// 内核启动栈。
@@ -44,7 +44,7 @@ static BOOT_STACK: BootStack = BootStack([0; 64 * 1024]);
 /// extern "C": 用 C 调用约定（System V ABI），保证 Limine / 链接脚本
 /// 找得到这个符号、且函数行为符合约定。
 #[unsafe(no_mangle)] // 保留符号名 _start 不被 Rust 改名混淆（危险属性需显式 unsafe）
-#[link_section = ".text.entry"] // 放进链接脚本里的入口节（排在代码段最前）
+#[unsafe(link_section = ".text.entry")] // 放进链接脚本里的入口节（排在代码段最前）
 #[unsafe(naked)]
 pub extern "C" fn _start() -> ! {
     naked_asm!(
@@ -67,7 +67,7 @@ pub extern "C" fn _start() -> ! {
 }
 
 /// Rust 世界的入口。先让串口说话，再向 Limine 领屏幕。
-#[no_mangle]
+#[unsafe(no_mangle)] // 同上：危险属性显式 unsafe（edition 2024 强制）
 pub extern "C" fn kmain() -> ! {
     // 串口全局化：从这以后任何代码（包括中断处理函数）都能 serial::print
     serial::init();
