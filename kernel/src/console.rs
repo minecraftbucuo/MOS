@@ -2,6 +2,7 @@
 
 use crate::boot::Framebuffer;
 use crate::font::{GLYPH_HEIGHT, GLYPHS, GLYPH_WIDTH};
+use core::cell::UnsafeCell;
 
 /// 文本控制台：屏幕参数 + 光标位置
 pub struct Console {
@@ -90,10 +91,11 @@ impl Console {
         }
     }
 
-    /// 处理一个字节：'\n' 换行，可打印字符盖章右移，其余忽略
+    /// 处理一个字节：'\n' 换行，退格，可打印字符盖章右移，其余忽略
     pub fn put_byte(&mut self, b: u8) {
         match b {
             b'\n' => self.newline(),
+            b'\x08' => self.backspace(),
             0x20..=0x7E => {
                 self.draw_char(self.col, self.row, b);
                 self.col += 1;
@@ -112,6 +114,14 @@ impl Console {
         }
     }
 
+    /// 退格：光标退一格，把那格涂回背景色
+    fn backspace(&mut self) {
+        if self.col > 0 {
+            self.col -= 1;
+            self.draw_char(self.col, self.row, b' ');
+        }
+    }
+
     /// 换行：光标下移一行；已在最底行则滚屏
     fn newline(&mut self) {
         self.col = 0;
@@ -120,5 +130,38 @@ impl Console {
         } else {
             self.scroll();
         }
+    }
+}
+
+// ---------- 全局化（模式同 serial.rs 的 Shared） ----------
+// 键盘处理函数要把字符印上屏，Console 不能再是 kmain 的局部变量
+
+/// 共享包装：UnsafeCell + 手写 Sync（单核、且从不并发写，安全）
+struct Shared<T>(UnsafeCell<T>);
+unsafe impl<T> Sync for Shared<T> {}
+impl<T> Shared<T> {
+    const fn new(value: T) -> Self {
+        Self(UnsafeCell::new(value))
+    }
+    fn get(&self) -> &mut T {
+        unsafe { &mut *self.0.get() }
+    }
+}
+
+/// 全局控制台。屏幕拿到之前是 None——那时 print 静默丢弃
+///（真机没给 framebuffer 的场合，内核也不至于崩）
+static CONSOLE: Shared<Option<Console>> = Shared::new(None);
+
+/// 拿到屏幕后调用（kmain）：建控制台并清屏
+pub fn init(fb: &Framebuffer) {
+    let mut con = Console::new(fb);
+    con.clear();
+    *CONSOLE.get() = Some(con);
+}
+
+/// 打印到屏幕（全局入口，谁都能调）
+pub fn print(s: &str) {
+    if let Some(con) = CONSOLE.get().as_mut() {
+        con.write_str(s);
     }
 }

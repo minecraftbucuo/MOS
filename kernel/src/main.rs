@@ -9,6 +9,10 @@ use core::panic::PanicInfo;
 mod boot;
 mod console;
 mod font;
+mod gdt;
+mod interrupts;
+mod keyboard;
+mod pic;
 mod serial;
 
 /// 贴在 .limine_requests 节区里的"需求单"。
@@ -65,34 +69,51 @@ pub extern "C" fn _start() -> ! {
 /// Rust 世界的入口。先让串口说话，再向 Limine 领屏幕。
 #[no_mangle]
 pub extern "C" fn kmain() -> ! {
-    let mut com1 = serial::SerialPort::new(serial::SerialPort::COM1);
-    com1.init();
-    com1.send_str("\n=== MOS booting ===\n");
+    // 串口全局化：从这以后任何代码（包括中断处理函数）都能 serial::print
+    serial::init();
+    serial::print("\n=== MOS booting ===\n");
+
+    // 换上自己的 GDT/TSS（中断系统的地基，必须在开中断之前）
+    gdt::init();
+    serial::print("gdt loaded\n");
+
+    // 立起 IDT 电话簿，然后自测：手动按响 3 号门铃（断点）。
+    // 处理函数打印完会"若无其事"地回来——中断系统的第一次往返
+    interrupts::init();
+    serial::print("idt loaded, ringing int3...\n");
+    unsafe { core::arch::asm!("int3") };
+    serial::print("returned from int3, interrupts work\n");
+
+    // 外设中断三件套：重映射 PIC → 放行时钟和键盘 → 开中断
+    pic::remap();
+    pic::unmask(0); // IRQ0：时钟
+    pic::unmask(1); // IRQ1：键盘
+    pic::init_timer(100);
+    unsafe { core::arch::asm!("sti") };
+    serial::print("interrupts enabled, clock ticking\n");
 
     match FRAMEBUFFER_REQUEST.response() {
         Some(resp) if !resp.framebuffers().is_empty() => {
             let fb = resp.framebuffers()[0];
-            com1.send_str("framebuffer acquired\n");
+            serial::print("framebuffer acquired\n");
 
-            let mut con = console::Console::new(fb);
-            con.clear();
-            con.write_str("=== MOS booting ===\n");
-            con.write_str("hello, screen!\n\n");
+            // 控制台全局化：键盘处理函数里也能上屏了
+            console::init(fb);
+            console::print("=== MOS booting ===\n");
+            console::print("hello, screen!\n\n");
+            console::print("keyboard ready - type something!\n\n");
 
-            // 滚屏验证：这行字重复 60 遍，超过一屏（约 48 行）后旧内容上滚
-            for _ in 0..60 {
-                con.write_str("the quick brown fox jumps over the lazy dog\n");
-            }
-
-            com1.send_str("text drawn\n");
+            serial::print("console up\n");
         }
         _ => {
-            com1.send_str("no framebuffer!\n");
+            serial::print("no framebuffer!\n");
         }
     }
 
+    // 主循环升级：hlt = 躺下等门铃。每次滴答醒来处理完，接着睡——
+    // 这就是操作系统主循环的雏形（以后会进化成调度器）
     loop {
-        core::hint::spin_loop();
+        unsafe { core::arch::asm!("hlt") };
     }
 }
 

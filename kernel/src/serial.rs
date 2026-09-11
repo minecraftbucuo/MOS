@@ -4,6 +4,7 @@
 //! 对应教程：docs/03-串口输出.md
 
 use core::arch::asm;
+use core::cell::UnsafeCell;
 
 /// 往 IO 端口写一个字节（"递字条"）
 ///
@@ -43,7 +44,7 @@ impl SerialPort {
     /// COM1 的标准端口号，IBM PC 时代传下来的老门牌
     pub const COM1: u16 = 0x3F8;
 
-    pub fn new(base: u16) -> Self {
+    pub const fn new(base: u16) -> Self {
         Self { base }
     }
 
@@ -70,7 +71,12 @@ impl SerialPort {
 
     /// 发送字符串。'\n' 自动补 '\r'（电传打字机的老规矩：先回行首再卷纸）
     pub fn send_str(&mut self, s: &str) {
-        for &b in s.as_bytes() {
+        self.send_bytes(s.as_bytes());
+    }
+
+    /// 发送原始字节（'\n' 同样补 '\r'）
+    pub fn send_bytes(&mut self, bytes: &[u8]) {
+        for &b in bytes {
             match b {
                 b'\n' => {
                     self.send_raw(b'\r');
@@ -80,4 +86,52 @@ impl SerialPort {
             }
         }
     }
+}
+
+// ---------- 全局单例：中断处理函数里也要打印日志 ----------
+
+/// 共享包装：让 static 里也能放 SerialPort（模式同 boot.rs 的请求单）。
+///
+/// unsafe impl Sync 的担保理由：
+/// 单核机器 + 中断门进入处理函数时 CPU 自动关中断（见中断一章），
+/// 任何时刻最多一个执行流在操作串口
+struct Shared<T>(UnsafeCell<T>);
+
+unsafe impl<T> Sync for Shared<T> {}
+
+impl<T> Shared<T> {
+    const fn new(value: T) -> Self {
+        Self(UnsafeCell::new(value))
+    }
+
+    fn get(&self) -> &mut T {
+        unsafe { &mut *self.0.get() }
+    }
+}
+
+/// 全局 COM1：内核任何代码（包括中断处理函数）都能借它说话
+static COM1: Shared<SerialPort> = Shared::new(SerialPort::new(SerialPort::COM1));
+
+/// 开机初始化（kmain 里调用一次，替代原来的局部变量写法）
+pub fn init() {
+    COM1.get().init();
+}
+
+/// 打印字符串——内核版 print!
+pub fn print(s: &str) {
+    COM1.get().send_str(s);
+}
+
+/// 按 16 进制打印 u64（no_std 没有 format!，自己排）
+pub fn print_hex(value: u64) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut buf = [b'0'; 16];
+    let mut v = value;
+    for i in (0..16).rev() {
+        buf[i] = HEX[(v & 0xF) as usize];
+        v >>= 4;
+    }
+    // 去掉前导零（全零时保留一个 '0'）
+    let start = buf.iter().position(|&b| b != b'0').unwrap_or(15);
+    COM1.get().send_bytes(&buf[start..]);
 }
