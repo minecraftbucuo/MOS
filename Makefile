@@ -6,15 +6,23 @@
 KERNEL_ELF := kernel/target/x86_64-unknown-none/debug/mos-kernel
 LIMINE_DIR := limine
 
+# 内核源文件清单：make 靠时间戳决定要不要重编
+KERNEL_SRC := $(shell find kernel/src -type f -name '*.rs')
+
 # OVMF：UEFI 固件的模拟实现（CODE 只读剧本 + VARS 可写笔记本）
 OVMF_CODE  := /usr/share/ovmf/x64/OVMF_CODE.4m.fd
 OVMF_VARS  := OVMF_VARS.4m.fd
 
 # ---------- 目标 ----------
 
-# 只编译内核，不打包不开机（改代码后快速验证用）
+# 只编译内核，不打包不开机（改代码后快速验证用）。
+# 注意必须 cd 进 kernel 再编：cargo 只从"当前目录"向上找 .cargo/config.toml
 check:
-	$(MAKE) -C kernel
+	cd kernel && cargo build
+
+# 告诉 make：内核 ELF 由这些文件生成，谁比 ELF 新就重编
+$(KERNEL_ELF): $(KERNEL_SRC) kernel/Cargo.toml kernel/.cargo/config.toml kernel/linker.ld
+	cd kernel && cargo build
 
 # 编译内核 + 装箱 + 写 BIOS 引导记录，产出 mos.iso
 iso: $(KERNEL_ELF)
@@ -53,7 +61,7 @@ limine:
 	$(MAKE) -C $(LIMINE_DIR)
 
 clean:
-	$(MAKE) -C kernel clean
+	cd kernel && cargo clean
 	rm -rf iso_root mos.iso
 
 .PHONY: check iso run burn limine clean
