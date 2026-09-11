@@ -4,8 +4,13 @@ target/
 # 制作的 ISO 镜像
 *.iso
 
-# limine 二进制目录（构建时下载）
-kernel/limine/
+# Limine 引导器（构建时下载）
+limine/
+limine-binary.zip
+
+# QEMU 运行产物
+OVMF_VARS.4m.fd
+iso_root/
 
 # 编辑器
 .idea/

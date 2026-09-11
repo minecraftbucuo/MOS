@@ -24,14 +24,24 @@ SECTIONS
         *(.text .text.*)       /* 其余所有代码 */
     }
 
-    /* 只读数据：字符串常量等 */
+    /* 只读数据：字符串常量等。
+       .gcc_except_table 是异常处理表，也是只读的，一并收编 */
     .rodata : ALIGN(4K) {
         *(.rodata .rodata.*)
+        *(.gcc_except_table .gcc_except_table.*)
     }
 
-    /* 已初始化的可写数据 */
+    /* 已初始化的可写数据。
+       注意 .got（全局偏移表）、.init_array 这些节脚本里若不点名，
+       链接器会当"孤儿节"随手塞进相邻节后面、不做页对齐——
+       曾导致可写 .got 与只读 .rodata 同页，Limine 拒绝加载。
+       显式收编到可写区（且整节页对齐），杜绝此类问题 */
     .data : ALIGN(4K) {
         *(.data .data.*)
+        *(.data.rel.ro .data.rel.ro.*)
+        *(.got .got.*)
+        *(.init_array .init_array.*)
+        *(.fini_array .fini_array.*)
     }
 
     /* 未初始化数据（如我们的内核栈）：
