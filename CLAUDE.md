@@ -3,7 +3,7 @@
 ## 项目概况
 
 - 目标：用 Rust 在 x86_64 上从零写一个教学性质操作系统，UEFI 启动，QEMU 开发、真机（U 盘）可运行
-- 技术栈：Rust（no_std）、Limine Boot Protocol、QEMU（OVMF）、xorriso
+- 技术栈：Rust（no_std、edition 2024、stable 工具链）、Limine Boot Protocol、QEMU（OVMF）、xorriso
 - 技术方案与分阶段路线图：见 `docs/` 教程目录
 
 ## 协作模式（重要）
