@@ -19,7 +19,7 @@ pub struct Console {
 }
 
 impl Console {
-    /// 白字黑底。颜色排布是 0x00BBGGRR，同上一章渐变图的算法
+    /// 白字黑底。颜色排布 0x00RRGGBB（高字节红、低字节蓝），同第 05 章渐变图
     pub fn new(fb: &Framebuffer) -> Self {
         Self {
             base: fb.address(),
@@ -35,7 +35,7 @@ impl Console {
         }
     }
 
-    /// 整屏涂成背景色
+    /// 整屏涂成背景色（开机时用一次；游戏画面走 blit 双缓冲通道）
     pub fn clear(&mut self) {
         for y in 0..self.height {
             for x in 0..self.width {
@@ -63,6 +63,20 @@ impl Console {
                 }
             }
         }
+    }
+
+    /// 双缓冲翻页：把后备缓冲整块拷进显存。
+    /// 画面先画在屏外缓冲里，画完一次拷贝上屏——显示刷新要么看到
+    /// 旧帧、要么看到新帧，永远逮不到"画到一半"的中间态
+    fn blit(&self, buf: *const u8) {
+        unsafe {
+            core::ptr::copy_nonoverlapping(buf, self.base, self.pitch * self.height);
+        }
+    }
+
+    /// 屏幕像素尺寸：(宽, 高)
+    fn pixel_size(&self) -> (usize, usize) {
+        (self.width, self.height)
     }
 
     /// 滚屏：整屏内容上移一行，最底一行腾出来
@@ -163,5 +177,28 @@ pub fn init(fb: &Framebuffer) {
 pub fn print(s: &str) {
     if let Some(con) = CONSOLE.get().as_mut() {
         con.write_str(s);
+    }
+}
+
+/// 全局：屏幕像素尺寸（宽, 高）
+pub fn pixel_size() -> (usize, usize) {
+    match CONSOLE.get() {
+        Some(con) => con.pixel_size(),
+        None => (0, 0),
+    }
+}
+
+/// 全局：后备缓冲画布的参数（行距字节数, 总字节数）
+pub fn canvas() -> (usize, usize) {
+    match CONSOLE.get() {
+        Some(con) => (con.pitch, con.pitch * con.height),
+        None => (0, 0),
+    }
+}
+
+/// 全局：双缓冲翻页——后备缓冲整块拷上屏
+pub fn blit(buf: *const u8) {
+    if let Some(con) = CONSOLE.get() {
+        con.blit(buf);
     }
 }

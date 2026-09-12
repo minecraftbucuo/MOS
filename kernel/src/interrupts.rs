@@ -125,6 +125,12 @@ stub!(stub_keyboard, exc_keyboard, "push 0");
 /// 原子变量——"读出来加一写回去"可能被下一次中断拦腰打断
 static TICKS: AtomicU64 = AtomicU64::new(0);
 
+/// 开机以来的滴答数（100 滴答 = 1 秒）。
+/// 游戏模块拿它当随机种子和节拍；主循环轮询它，中断里不干活
+pub fn ticks() -> u64 {
+    TICKS.load(Ordering::Relaxed)
+}
+
 /// 时钟处理函数：每次滴答 +1，每满 100 次（1 秒）报个到，交回执
 extern "C" fn exc_timer(_frame: &mut IsrFrame) {
     let ticks = TICKS.fetch_add(1, Ordering::Relaxed) + 1;

@@ -14,23 +14,14 @@ static START: AtomicUsize = AtomicUsize::new(0); // 堆底（虚拟地址）
 static SIZE: AtomicUsize = AtomicUsize::new(0); // 总大小（字节）
 static TOP: AtomicUsize = AtomicUsize::new(0); // 游标：已用到的偏移
 
-/// 建堆：从页帧分配器连拿 pages 页。
-/// 返回 false = 页不够、或拿到的页物理不连续
+/// 建堆：向页帧分配器要一段连续的 pages 页。
+/// 返回 false = 找不到这么长的连续空闲段
 ///（bump 堆靠 HHDM 直映射用内存，物理连续才在虚拟地址上连成一块）
 pub fn init(pages: u64) -> bool {
-    let mut first = 0u64;
-    for i in 0..pages {
-        match mm::alloc_frame() {
-            Some(p) => {
-                if i == 0 {
-                    first = p;
-                } else if p != first + i * mm::PAGE_SIZE {
-                    return false; // 不连续：简化处理，直接宣布失败
-                }
-            }
-            None => return false,
-        }
-    }
+    let first = match mm::alloc_frame_contig(pages) {
+        Some(p) => p,
+        None => return false,
+    };
 
     START.store(mm::phys_to_virt(first) as usize, Ordering::Relaxed);
     SIZE.store((pages * mm::PAGE_SIZE) as usize, Ordering::Relaxed);

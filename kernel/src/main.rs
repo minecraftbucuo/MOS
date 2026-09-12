@@ -13,12 +13,14 @@ mod boot;
 mod console;
 mod font;
 mod gdt;
+mod game;
 mod heap;
 mod interrupts;
 mod keyboard;
 mod mm;
 mod pic;
 mod serial;
+mod sync;
 
 /// 贴在 .limine_requests 节区里的"需求单"。
 ///
@@ -150,9 +152,12 @@ pub extern "C" fn kmain() -> ! {
                     serial::print_hex(p4);
                     serial::print("\n");
 
-                    // 建堆：16 页（64KB）
-                    if heap::init(16) {
-                        serial::print("heap up: 64 KiB\n");
+                    // 建堆：1080 页（约 4.2MB）——
+                    // 番外篇贪吃蛇的 4MB 双缓冲画布是堆的头号大客户
+                    if heap::init(1080) {
+                        serial::print("heap up: ");
+                        serial::print_hex(1080);
+                        serial::print(" pages\n");
 
                         // 内核里第一次动态分配
                         let b = alloc::boxed::Box::new(0x1234_5678u64);
@@ -218,10 +223,14 @@ pub extern "C" fn kmain() -> ! {
         }
     }
 
+    // 番外篇：贪吃蛇开场——先放一颗食物上屏（蛇与输入在后面步骤接上）
+    game::init();
+
     // 主循环升级：hlt = 躺下等门铃。每次滴答醒来处理完，接着睡——
     // 这就是操作系统主循环的雏形（以后会进化成调度器）
     loop {
         unsafe { core::arch::asm!("hlt") };
+        game::on_tick(interrupts::ticks());
     }
 }
 

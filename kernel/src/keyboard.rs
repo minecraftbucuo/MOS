@@ -1,9 +1,11 @@
-//! PS/2 键盘驱动：读扫描码，翻译成字符上屏。
+//! PS/2 键盘驱动：读扫描码，翻译后投递进按键队列。
 //! 对应教程：docs/07-中断与时钟.md
+//!
+//! 输入架构（番外篇起）：中断里只把键塞进队列，谁消费谁处理——
+//! 贪吃蛇消费方向键，将来的 shell 消费行编辑。ISR 要短，重活在主循环干。
 
-use crate::console;
 use crate::serial::inb;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 /// 扫描码集 1 的 ASCII 对照表：下标 = 扫描码，值 = 字符（0 = 无对应字符）。
 /// 按行对应键盘物理排布，对照着看很直观
@@ -28,12 +30,61 @@ static SHIFT: AtomicBool = AtomicBool::new(false);
 /// 上一码是扩展前缀 0xE0 吗（方向键等会先发一个 0xE0）
 static EXTENDED: AtomicBool = AtomicBool::new(false);
 
-/// 键盘中断到来：从 0x60 端口取一个扫描码，翻译上屏
+// ---------- 按键队列：环形缓冲，中断生产、主循环消费 ----------
+// 单生产者单消费者，读写位置各自只被一方改动，原子变量足够，不需要锁
+
+/// 特殊键码：0x80 以上留给"没有字符对应"的键（方向键这类）
+pub const KEY_LEFT: u8 = 0x81;
+pub const KEY_RIGHT: u8 = 0x82;
+pub const KEY_UP: u8 = 0x83;
+pub const KEY_DOWN: u8 = 0x84;
+
+const Q_LEN: usize = 32; // 2 的幂，取模就是位与（这里用 %，意思更直白）
+static QUEUE: [AtomicU8; Q_LEN] = [const { AtomicU8::new(0) }; Q_LEN];
+static Q_HEAD: AtomicUsize = AtomicUsize::new(0); // 写位置（中断动）
+static Q_TAIL: AtomicUsize = AtomicUsize::new(0); // 读位置（主循环动）
+
+/// 中断侧：投一个键进队列。队列满了直接丢——ISR 里不能等
+fn push_key(k: u8) {
+    let head = Q_HEAD.load(Ordering::Relaxed);
+    let next = (head + 1) % Q_LEN;
+    if next == Q_TAIL.load(Ordering::Relaxed) {
+        return; // 满了。32 格攒不满的，满了说明消费端死了，丢了也不亏
+    }
+    QUEUE[head].store(k, Ordering::Relaxed);
+    Q_HEAD.store(next, Ordering::Relaxed);
+}
+
+/// 消费侧：取一个键，队列空返回 None
+pub fn pop_key() -> Option<u8> {
+    let tail = Q_TAIL.load(Ordering::Relaxed);
+    if tail == Q_HEAD.load(Ordering::Relaxed) {
+        return None; // head == tail = 队列空
+    }
+    let k = QUEUE[tail].load(Ordering::Relaxed);
+    Q_TAIL.store((tail + 1) % Q_LEN, Ordering::Relaxed);
+    Some(k)
+}
+
+/// 键盘中断到来：从 0x60 端口取一个扫描码，翻译后投递进队列
 pub fn on_interrupt() {
     let sc = inb(0x60); // 键盘控制器的数据口
 
-    // 扩展码：0xE0 后面跟的码（方向键/小键盘区）先忽略
+    // 扩展码后半段：方向键/小键盘区，认得出方向就投递
     if EXTENDED.swap(false, Ordering::Relaxed) {
+        let released = sc & 0x80 != 0;
+        let code = sc & 0x7F;
+        if !released {
+            // 扫描码集 1 扩展段：四个方向键的编码
+            //（注意别抄成集 2 的 0x72/0x74/0x75——我们全程用集 1）
+            match code {
+                0x4B => push_key(KEY_LEFT),
+                0x4D => push_key(KEY_RIGHT),
+                0x48 => push_key(KEY_UP),
+                0x50 => push_key(KEY_DOWN),
+                _ => {} // 其余扩展键（Home/End 等）暂不认
+            }
+        }
         return;
     }
     if sc == 0xE0 {
@@ -53,11 +104,7 @@ pub fn on_interrupt() {
                 &NORMAL
             };
             if let Some(&ch) = table.get(code as usize).filter(|&&c| c != 0) {
-                // 单字节 ASCII 一定是合法 UTF-8，from_utf8 不会失败
-                let buf = [ch];
-                if let Ok(s) = core::str::from_utf8(&buf) {
-                    console::print(s); // '\n'、退格、可打印字符都由 put_byte 处理
-                }
+                push_key(ch); // 字符键也走队列，消费方决定拿它干嘛
             }
         }
     }

@@ -100,6 +100,11 @@ impl FrameAllocator {
         }
     }
 
+    /// 查一位：这页空闲吗
+    fn is_free(&self, pfn: u64) -> bool {
+        unsafe { *self.bitmap.add((pfn / 8) as usize) & (1 << (pfn % 8)) != 0 }
+    }
+
     /// 数一遍空闲页（开机统计用；以后这函数会变得很慢——那是后话）
     fn count_free(&self) -> u64 {
         let bitmap_len = (self.frames as usize + 7) / 8;
@@ -169,6 +174,34 @@ pub fn alloc_frame() -> Option<u64> {
         i += 1;
     }
     None // 位图里再没有 1：内存发完了
+}
+
+/// 连续发 pages 页：位图里找一段连续的空闲串，整段标成已占。
+/// 堆这类"要一整块连续内存"的客户用这个——逐页领的话，
+/// 领到 usable 区段的边界就会撞上不连续，前功尽弃
+pub fn alloc_frame_contig(pages: u64) -> Option<u64> {
+    let a = ALLOCATOR.get().as_mut()?;
+
+    // 线性扫一遍位图，数"连续空闲"的长度，够 pages 就整段拿下
+    let mut run_start = 0u64;
+    let mut run_len = 0u64;
+    for pfn in 0..a.frames {
+        if a.is_free(pfn) {
+            if run_len == 0 {
+                run_start = pfn;
+            }
+            run_len += 1;
+            if run_len == pages {
+                for p in run_start..run_start + pages {
+                    a.set_used(p);
+                }
+                return Some(run_start * PAGE_SIZE);
+            }
+        } else {
+            run_len = 0; // 串断了，从头再数
+        }
+    }
+    None // 找不到足够长的连续空闲段
 }
 
 /// 收回一页（参数是 alloc_frame 当时给的物理地址）
