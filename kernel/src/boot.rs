@@ -180,6 +180,49 @@ impl MemmapEntry {
     }
 }
 
+/// RSDP 请求：要 ACPI 根表的地址。
+///
+/// ACPI 是固件开机制作并留在内存里的"硬件清单"：一张根表（RSDP）指着
+/// 描述符表（XSDT），描述符表再指着一张张子表（找 HPET 定时器用）。
+/// 注意：revision 0 拿到的地址是 Limine 映射好的虚拟地址，可直接读
+#[repr(C)]
+pub struct RsdpRequest {
+    magic: [u64; 2],
+    id: [u64; 2],
+    revision: u64,
+    response: UnsafeCell<*mut RsdpResponse>,
+}
+
+unsafe impl Sync for RsdpRequest {}
+
+impl RsdpRequest {
+    pub const fn new() -> Self {
+        Self {
+            magic: COMMON_MAGIC,
+            id: [0xc5e77b6b397e7b43, 0x27637845accdcf3c],
+            revision: 0,
+            response: UnsafeCell::new(core::ptr::null_mut()),
+        }
+    }
+
+    /// 回执：RSDP 的（虚拟）地址
+    pub fn response(&self) -> Option<*const u8> {
+        let ptr = unsafe { self.response.get().read_volatile() };
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { (*ptr).address })
+        }
+    }
+}
+
+/// RSDP 响应：只有一个指针
+#[repr(C)]
+struct RsdpResponse {
+    revision: u64,
+    address: *const u8,
+}
+
 /// HHDM（Higher Half Direct Map）请求：问"物理内存镜像在高地址的偏移量"。
 ///
 /// Limine 把全部物理内存按固定偏移镜像进虚拟地址空间：

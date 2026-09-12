@@ -9,6 +9,7 @@ extern crate alloc;
 use core::arch::naked_asm;
 use core::panic::PanicInfo;
 
+mod acpi;
 mod boot;
 mod console;
 mod font;
@@ -39,6 +40,11 @@ static MEMMAP_REQUEST: boot::MemmapRequest = boot::MemmapRequest::new();
 #[used]
 #[unsafe(link_section = ".limine_requests")]
 static HHDM_REQUEST: boot::HhdmRequest = boot::HhdmRequest::new();
+
+/// ACPI 根表的需求单（找 HPET 定时器用）
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+static RSDP_REQUEST: boot::RsdpRequest = boot::RsdpRequest::new();
 
 /// 内核启动栈。
 /// #[repr(align(16))]: x86-64 ABI 要求栈按 16 字节对齐，否则
@@ -90,41 +96,70 @@ pub extern "C" fn kmain() -> ! {
     serial::init();
     serial::print("\n=== MOS booting ===\n");
 
-    // 08 章：打印物理内存清单——分配器的原材料目录
+    // 先点亮屏幕（诊断版启动顺序）：真机没有串口，屏幕是唯一输出通道，
+    // 而第 05 章已证明真机屏幕本身是通的——把它挪到一切初始化之前，
+    // 后面每一步都上屏报一行，死在哪一步一眼可见。
+    // 此时还跑在 Limine 留下的 GDT 上，纯写显存不依赖任何我们自己建的东西
+    match FRAMEBUFFER_REQUEST.response() {
+        Some(resp) if !resp.framebuffers().is_empty() => {
+            let fb = resp.framebuffers()[0];
+            console::init(fb);
+            console::print("=== MOS booting ===\n");
+            console::print("screen up\n");
+            // 诊断：把 framebuffer 真实尺寸报上屏。QEMU 窗口会缩放，
+            // 窗口大小不等于分辨率——信内核自己报的数
+            let (sw, sh) = console::pixel_size();
+            console::print("screen: ");
+            console::print_hex(sw as u64);
+            console::print("x");
+            console::print_hex(sh as u64);
+            console::print("\n");
+        }
+        _ => serial::print("no framebuffer!\n"),
+    }
+
+    // 08 章：打印物理内存清单——分配器的原材料目录。
+    // 实机诊断：清单直接打上屏幕（真机串口不可见，屏幕才是终端）——
+    // 卡在哪一行、哪个区段，当场可见；QEMU 里照样能看到
     match MEMMAP_REQUEST.response() {
         Some(resp) => {
-            serial::print("memory map:\n");
+            console::print("memory map:\n");
             let mut usable_total: u64 = 0;
             for e in resp.entries() {
-                serial::print("  ");
-                serial::print_hex(e.base);
-                serial::print(" +");
-                serial::print_hex(e.length);
-                serial::print(" ");
-                serial::print(e.kind_name());
-                serial::print("\n");
+                console::print("  ");
+                console::print_hex(e.base);
+                console::print(" +");
+                console::print_hex(e.length);
+                console::print(" ");
+                console::print(e.kind_name());
+                console::print("\n");
                 if e.kind == boot::MEMMAP_USABLE {
                     usable_total += e.length;
                 }
             }
-            serial::print("usable total: ");
-            serial::print_hex(usable_total / 1024 / 1024);
-            serial::print(" MiB\n");
+            console::print("usable total: ");
+            console::print_hex(usable_total / 1024 / 1024);
+            console::print(" MiB\n");
 
             // 位图分配器上线（HHDM 偏移 = 物理地址翻译成虚拟地址的加数）
             if let Some(offset) = HHDM_REQUEST.response() {
+                console::print("hhdm ok\n");
+                console::print("mm init...\n");
                 if mm::init(resp, offset) {
                     let (total, free) = mm::stats();
-                    serial::print("frame allocator up: ");
-                    serial::print_hex(total);
-                    serial::print(" frames total, ");
-                    serial::print_hex(free);
-                    serial::print(" free\n");
+                    // 诊断期：这行也走屏幕——真机上串口是黑箱，
+                    // 诊断路径里不让它出现，冻结点才唯一归因
+                    console::print("mm up: ");
+                    console::print_hex(total);
+                    console::print(" frames, ");
+                    console::print_hex(free);
+                    console::print(" free\n");
 
                     // 现场实验：发页 → 写读验证 → 收回重发
                     let p1 = mm::alloc_frame().unwrap();
                     let p2 = mm::alloc_frame().unwrap();
                     let p3 = mm::alloc_frame().unwrap();
+                    console::print("mm: alloc3 ok\n");
                     serial::print("alloc 3 frames: ");
                     serial::print_hex(p1);
                     serial::print(" ");
@@ -144,19 +179,30 @@ pub extern "C" fn kmain() -> ! {
                             serial::print("page write/read FAILED!\n");
                         }
                     }
+                    console::print("mm: rw ok\n");
 
                     // 收回 p2 再发：该拿回同一页（free 生效 + 游标回退的证据）
                     mm::free_frame(p2);
                     let p4 = mm::alloc_frame().unwrap();
+                    console::print("mm: realloc ok\n");
                     serial::print("free 2nd frame, realloc got: ");
                     serial::print_hex(p4);
                     serial::print("\n");
 
-                    // 建堆：1080 页（约 4.2MB）——
-                    // 番外篇贪吃蛇的 4MB 双缓冲画布是堆的头号大客户
-                    if heap::init(1080) {
+                    // 建堆：大小跟着屏幕走——贪吃蛇的双缓冲画布和屏幕一样大
+                    //（QEMU 1280×800 是 4MB；真机 2560×1600 是 16MB），
+                    // 堆必须比画布大一截。屏幕还没点亮就拿不到尺寸，给个保守值
+                    let (_pitch, canvas_size) = console::canvas();
+                    // canvas 给的是 usize，堆这边按 u64 记账——
+                    // Rust 没有隐式转换，同一宽度的 usize→u64 也得手写 as
+                    let heap_pages: u64 = if canvas_size > 0 {
+                        (canvas_size / 4096 + 512) as u64
+                    } else {
+                        1080
+                    };
+                    if heap::init(heap_pages) {
                         serial::print("heap up: ");
-                        serial::print_hex(1080);
+                        serial::print_hex(heap_pages);
                         serial::print(" pages\n");
 
                         // 内核里第一次动态分配
@@ -173,11 +219,15 @@ pub extern "C" fn kmain() -> ! {
                         serial::print_hex(v[4]);
                         serial::print("\n");
                         // 作用域结束：Drop 自动调 dealloc（bump 堆不回收，没有实际效果）
+                        console::print("heap: boxvec ok\n");
+                        console::print("heap up\n");
                     } else {
                         serial::print("heap init failed!\n");
+                        console::print("heap init FAILED!\n");
                     }
                 } else {
                     serial::print("frame allocator init failed!\n");
+                    console::print("mm init FAILED!\n");
                 }
             } else {
                 serial::print("no hhdm!\n");
@@ -189,6 +239,7 @@ pub extern "C" fn kmain() -> ! {
     // 换上自己的 GDT/TSS（中断系统的地基，必须在开中断之前）
     gdt::init();
     serial::print("gdt loaded\n");
+    console::print("gdt up\n");
 
     // 立起 IDT 电话簿，然后自测：手动按响 3 号门铃（断点）。
     // 处理函数打印完会"若无其事"地回来——中断系统的第一次往返
@@ -196,41 +247,49 @@ pub extern "C" fn kmain() -> ! {
     serial::print("idt loaded, ringing int3...\n");
     unsafe { core::arch::asm!("int3") };
     serial::print("returned from int3, interrupts work\n");
+    console::print("idt up\n");
 
     // 外设中断三件套：重映射 PIC → 放行时钟和键盘 → 开中断
     pic::remap();
     pic::unmask(0); // IRQ0：时钟
     pic::unmask(1); // IRQ1：键盘
     pic::init_timer(100);
+    // 诊断：PIT 活体检测（真机实测 P+：芯片活着，在数数）
+    console::print(if pic::pit_alive() {
+        "pit counting\n"
+    } else {
+        "pit STUCK!\n"
+    });
+
+    // HPET 悬案的工具箱：这里只记下两个地址（纯存数，不碰任何指针），
+    // 启动路径与没有 HPET 这回事时一字不差。真正的探测锁在游戏里的
+    // H 键后面——出事也只坏"按下 H 之后"的世界，开机永远安全
+    if let (Some(rsdp), Some(hhdm)) = (RSDP_REQUEST.response(), HHDM_REQUEST.response()) {
+        acpi::stash(rsdp, hhdm);
+    }
+
     unsafe { core::arch::asm!("sti") };
     serial::print("interrupts enabled, clock ticking\n");
-
-    match FRAMEBUFFER_REQUEST.response() {
-        Some(resp) if !resp.framebuffers().is_empty() => {
-            let fb = resp.framebuffers()[0];
-            serial::print("framebuffer acquired\n");
-
-            // 控制台全局化：键盘处理函数里也能上屏了
-            console::init(fb);
-            console::print("=== MOS booting ===\n");
-            console::print("hello, screen!\n\n");
-            console::print("keyboard ready - type something!\n\n");
-
-            serial::print("console up\n");
-        }
-        _ => {
-            serial::print("no framebuffer!\n");
-        }
-    }
+    console::print("interrupts on\n");
+    console::print("keyboard ready - type something!\n");
 
     // 番外篇：贪吃蛇开场——先放一颗食物上屏（蛇与输入在后面步骤接上）
     game::init();
 
-    // 主循环升级：hlt = 躺下等门铃。每次滴答醒来处理完，接着睡——
+    // 主循环。原来用 hlt 躺下等中断——但真机的时钟中断一次都不来
+    //（实测 T=0：PIT 芯片活着、没人拦，信号却送不到），hlt 就永远
+    // 只能靠键盘叫醒，蛇没节拍。现在改成盯梢模式：CPU 主动盯着 PIT
+    // 计数器转圈，中断正常时轮询只旁观（QEMU 行为不变），中断死了
+    // 20ms 它就自己打拍子接管（真机蛇活过来）。
     // 这就是操作系统主循环的雏形（以后会进化成调度器）
+    let mut last_tick = 0u64;
     loop {
-        unsafe { core::arch::asm!("hlt") };
-        game::on_tick(interrupts::ticks());
+        interrupts::poll_pit_fallback();
+        let t = interrupts::ticks();
+        if t != last_tick {
+            last_tick = t;
+            game::on_tick(t);
+        }
     }
 }
 

@@ -41,16 +41,34 @@ impl FrameAllocator {
         let frames = top / PAGE_SIZE;
         let bitmap_len = (frames as usize + 7) / 8; // 每比特一页，向上取整
 
+        // —— 实机诊断插桩（直写 console，不碰串口；结案后拆除）——
+        crate::console::print("mm: top=");
+        crate::console::print_hex(top);
+        crate::console::print(" bitmap=");
+        crate::console::print_hex(bitmap_len as u64);
+        crate::console::print("\n");
+
         // 自举问题：位图自己也是块内存，分配器还没建好，只能手工占——
-        // 扫清单找第一段放得下的 usable 区借住
+        // 扫清单找第一段放得下的 usable 区借住。
+        // 但 1MB 以下的不选：低地址是固件祖传杂物间（EBDA、MP 表、
+        // SMRAM 遗留），真机上往那里塞几百 KB 的位图会踩到硬件怪癖
+        //（华硕实机：位图 613KB 挤进 0x1000 那段 641KB 的低地址段就冻住）
         let mut bitmap_phys = None;
         for e in resp.entries() {
-            if e.kind == boot::MEMMAP_USABLE && e.length >= bitmap_len as u64 {
+            if e.kind == boot::MEMMAP_USABLE
+                && e.base >= 0x10_0000 // 1MB
+                && e.length >= bitmap_len as u64
+            {
                 bitmap_phys = Some(e.base);
                 break;
             }
         }
         let bitmap_phys = bitmap_phys?;
+
+        // —— 诊断：位图住进了哪段物理内存 ——
+        crate::console::print("mm: bitmap at ");
+        crate::console::print_hex(bitmap_phys);
+        crate::console::print("\n");
 
         let mut this = Self {
             bitmap: phys_to_virt(bitmap_phys),
@@ -59,11 +77,14 @@ impl FrameAllocator {
         };
 
         unsafe {
-            // 位图清零 = 全部"已占"，接着只把 usable 点亮
+            // —— 诊断插桩：清零和点亮分开报 ——
+            crate::console::print("mm: zeroing ");
             core::ptr::write_bytes(this.bitmap, 0, bitmap_len);
+            crate::console::print("done\n");
 
             // usable 区间逐页点亮。头向上取整、尾向下取整——
             // 区间两端不完整的页干脆丢弃（地址不齐的页没法按页管）
+            crate::console::print("mm: marking");
             for e in resp.entries() {
                 if e.kind != boot::MEMMAP_USABLE {
                     continue;
@@ -72,8 +93,13 @@ impl FrameAllocator {
                 let end = (e.base + e.length) / PAGE_SIZE;
                 for pfn in start..end {
                     this.set_free(pfn);
+                    if pfn % 0x40000 == 0 {
+                        // 进度点：每点亮 25 万页冒一个。点还在冒 = 没死，是慢
+                        crate::console::print(".");
+                    }
                 }
             }
+            crate::console::print("\n");
 
             // 位图自己借住的那几页标回"已占"——自己不能把自己发出去
             let bmp_pfn = bitmap_phys / PAGE_SIZE;
@@ -82,6 +108,9 @@ impl FrameAllocator {
                 this.set_used(pfn);
             }
         }
+
+        // —— 诊断：清零、点亮、自占三步全过才走到这 ——
+        crate::console::print("mm: bitmap ready\n");
 
         Some(this)
     }
@@ -134,9 +163,52 @@ impl<T> Shared<T> {
 
 static ALLOCATOR: Shared<Option<FrameAllocator>> = Shared::new(None);
 
+// ---------- 内存清单快照：ACPI 探针的护栏 ----------
+// 拿着陌生指针乱读 = 缺页异常 = 真机无声冻结（异常遗言走串口，
+// 真机看不见）。清单是固件亲口报的"哪些地址背后真有东西"，
+// 读之前先对着清单问一句，清单外的地址一律不碰
+
+/// 一段内存区段的存档
+#[derive(Clone, Copy)]
+pub struct Region {
+    pub base: u64,
+    pub len: u64,
+    pub kind: u64,
+}
+
+const MAX_REGIONS: usize = 128; // UEFI 清单一般几十段，128 封顶
+
+struct RegionMap {
+    count: usize,
+    regions: [Region; MAX_REGIONS],
+}
+
+static REGION_MAP: Shared<RegionMap> = Shared::new(RegionMap {
+    count: 0,
+    regions: [Region { base: 0, len: 0, kind: 0 }; MAX_REGIONS],
+});
+
 /// 建分配器（kmain 调一次）。返回 false = 没地方放位图
 pub fn init(resp: &MemmapResponse, hhdm_offset: u64) -> bool {
     HHDM_OFFSET.store(hhdm_offset, Ordering::Relaxed);
+
+    // 清单快照：先于一切，分配失败也不影响护栏可用
+    {
+        let m = REGION_MAP.get();
+        m.count = 0;
+        for e in resp.entries() {
+            if m.count >= MAX_REGIONS {
+                break;
+            }
+            m.regions[m.count] = Region {
+                base: e.base,
+                len: e.length,
+                kind: e.kind,
+            };
+            m.count += 1;
+        }
+    }
+
     match FrameAllocator::from_memmap(resp) {
         Some(a) => {
             *ALLOCATOR.get() = Some(a);
@@ -144,6 +216,27 @@ pub fn init(resp: &MemmapResponse, hhdm_offset: u64) -> bool {
         }
         None => false,
     }
+}
+
+/// 物理区间 [phys, phys+len) 是否落在清单里的 RAM 类区段内。
+/// RAM 类：0=usable、2=ACPI 可回收、3=ACPI NVS、5=bootloader 可回收——
+/// ACPI 表就住在 2/3 类里。RAM 之外的区段（reserved/MMIO 洞）
+/// 不保证被 Limine 映射过，读了可能缺页
+pub fn in_ram(phys: u64, len: u64) -> bool {
+    let m = REGION_MAP.get();
+    m.regions[..m.count].iter().any(|r| {
+        matches!(r.kind, 0 | 2 | 3 | 5) && phys >= r.base && phys + len <= r.base + r.len
+    })
+}
+
+/// 同上，但接受清单里任意类型（reserved 类常常就是 MMIO 区）。
+/// 比 in_ram 宽松：只保证"固件承认这地址存在"，不保证读起来安全，
+/// 只给用户明确同意过的冒险操作用
+pub fn in_map(phys: u64, len: u64) -> bool {
+    let m = REGION_MAP.get();
+    m.regions[..m.count]
+        .iter()
+        .any(|r| phys >= r.base && phys + len <= r.base + r.len)
 }
 
 /// 家底统计：（总页数, 空闲页数）

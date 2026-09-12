@@ -10,6 +10,7 @@ limine-binary.zip
 
 # QEMU 运行产物
 OVMF_VARS.4m.fd
+OVMF_VARS.fd
 iso_root/
 
 # 编辑器

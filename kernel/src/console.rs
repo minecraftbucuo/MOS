@@ -180,6 +180,22 @@ pub fn print(s: &str) {
     }
 }
 
+/// 按 16 进制打印 u64 到屏幕（serial::print_hex 的屏幕对应物）。
+/// no_std 没有 format!，手工排：16 个字符位从低位往高位填
+pub fn print_hex(value: u64) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut buf = [b'0'; 16];
+    let mut v = value;
+    for i in (0..16).rev() {
+        buf[i] = HEX[(v & 0xF) as usize];
+        v >>= 4;
+    }
+    // 去掉前导零（全零时保留一个 '0'）
+    let start = buf.iter().position(|&b| b != b'0').unwrap_or(15);
+    // buf 里只可能被填进 HEX 表的字符，UTF-8 校验必然通过
+    print(unsafe { core::str::from_utf8_unchecked(&buf[start..]) });
+}
+
 /// 全局：屏幕像素尺寸（宽, 高）
 pub fn pixel_size() -> (usize, usize) {
     match CONSOLE.get() {

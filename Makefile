@@ -49,6 +49,23 @@ run: iso
 	    -serial stdio \
 	    -no-reboot -no-shutdown
 
+# 模拟真机复现（华硕天选5 Pro 同款三件套）：
+#   16G 内存——位图 600KB+，内存布局形状和实机一致
+#   2560×1600 屏——画布 16MB，验证明明是 QEMU 屏 4 倍大的画布逻辑。
+#     分辨率靠 EDID：让 QEMU 显卡向固件广播"我支持 2560×1600"。
+#     （试过 fw_cfg 的 opt/ovmf/X-Resolution——Arch 的 edk2-ovmf 202608
+#      不认那个参数，分辨率原地不动，串口证据：heap up: 5E8 而非 11A0）
+#   KVM 直跑真 CPU——页表缓存属性等硬件行为是真的。看图形窗口
+run-real: iso
+	@test -f $(OVMF_VARS) || cp /usr/share/ovmf/x64/OVMF_VARS.4m.fd $(OVMF_VARS)
+	qemu-system-x86_64 -M q35 -m 16G -enable-kvm -cpu host \
+	    -vga none -device VGA,edid=on,xres=2560,yres=1600 \
+	    -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+	    -drive if=pflash,format=raw,file=$(OVMF_VARS) \
+	    -cdrom mos.iso \
+	    -serial stdio \
+	    -no-reboot -no-shutdown
+
 # 刻 U 盘：make burn DEV=/dev/sdX  （sdX 千万别写错！）
 burn: iso
 	sudo dd if=mos.iso of=$(DEV) bs=4M status=progress oflag=direct && sync
@@ -64,4 +81,4 @@ clean:
 	cd kernel && cargo clean
 	rm -rf iso_root mos.iso
 
-.PHONY: check iso run burn limine clean
+.PHONY: check iso run run-real burn limine clean

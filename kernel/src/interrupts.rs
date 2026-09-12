@@ -3,6 +3,7 @@
 //! 处理函数入口用手写汇编存根（stable 工具链没有 x86-interrupt
 //! 调用约定，和当初的 limine crate 同一个处境）。
 
+use crate::console;
 use crate::gdt::KERNEL_CODE_SELECTOR;
 use crate::keyboard;
 use crate::pic;
@@ -10,7 +11,7 @@ use crate::serial;
 use core::arch::asm;
 use core::arch::naked_asm;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
 
 /// 中断现场的完整布局（字段从低地址到高地址，与存根压栈顺序一致）。
 /// 寄存器字段是给调试输出留的，目前只读 rip——CPU 看不见这些，同 BOOT_STACK
@@ -131,16 +132,104 @@ pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
 }
 
-/// 时钟处理函数：每次滴答 +1，每满 100 次（1 秒）报个到，交回执
-extern "C" fn exc_timer(_frame: &mut IsrFrame) {
-    let ticks = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
-    if ticks % 100 == 0 {
+/// 滴答满 100 报个到（中断版和轮询版共用，免得两处一样的代码）
+fn announce_tick(total: u64) {
+    if total % 100 == 0 {
         serial::print("[timer] ");
-        serial::print_hex(ticks / 100);
+        serial::print_hex(total / 100);
         serial::print("s\n");
     }
+}
+
+/// 时钟处理函数：每次滴答 +1，每满 100 次（1 秒）报个到，交回执
+extern "C" fn exc_timer(_frame: &mut IsrFrame) {
+    announce_tick(TICKS.fetch_add(1, Ordering::Relaxed) + 1);
     // 回执！忘掉这行，时钟只会响一次
     pic::send_eoi(0);
+}
+
+// ---------- 备用心跳：轮询 PIT（真机时钟案的救场） ----------
+// 实测（华硕天选5 Pro）：IRQ0 一次都不来（T=0 P+ M0 I=00），但 PIT
+// 芯片自己在数数（P+）。既然节拍源活着、只是"中断"这条路断了——
+// 那就不靠中断，主循环直接读计数器。
+//
+// 第一版数"数满一圈"这个事件，真机上蛇明显偏慢：事件会丢——CPU 被
+// 固件用 SMM 叫走几毫秒，那几圈就白白漏掉。第二版改成记时间：每次
+// 轮询读计数器，两次读数的差 = 这段时间走过的 PIT 时钟数（mode 2
+// 每时钟正好 -1，重装回到除数值），累计起来除以除数 = 滴答数。
+// 漏轮询不要紧——差值把漏掉的时间自动补上，只要两次轮询间隔
+// 小于一个周期（10ms）就分毫不差。
+//
+// 谁来给 TICKS +1 的分工：QEMU 里 IRQ0 正常，滴答由中断函数加；
+// 一旦连续两个周期（20ms）滴答纹丝不动，判定 IRQ0 已死，轮询接管。
+
+/// 上次读到的 PIT 计数值
+static LAST_COUNT: AtomicU16 = AtomicU16::new(0);
+/// 累计走过的 PIT 输入时钟数（真表：1193182/秒）
+static ELAPSED_PIT: AtomicU64 = AtomicU64::new(0);
+/// 轮询已接管节拍了吗
+static FALLBACK: AtomicBool = AtomicBool::new(false);
+/// 上个重装点时的滴答数（用来发现"滴答停了"）
+static TICKS_LAST_WRAP: AtomicU64 = AtomicU64::new(u64::MAX);
+/// 连续几个周期滴答没动
+static STALLS: AtomicU8 = AtomicU8::new(0);
+
+/// 主循环每次迭代调一次：读 PIT 计数器记账时间，必要时替死掉的
+/// IRQ0 打拍子
+pub fn poll_pit_fallback() {
+    let c = pic::pit_count();
+    let prev = LAST_COUNT.swap(c, Ordering::Relaxed);
+
+    // 记时间：mode 2 计数器往下走、数到底重装回除数值。两次读数走过的
+    // 时钟数 = prev - c；碰上重装（c 反超 prev）就加一个周期补上。
+    // 注意不能拿 u32 回绕减法再取模——2^32 不是除数的倍数，模出来的
+    // 是垃圾数（模拟环境实测：每次重装多记约一拍，秒表跳着走）
+    let divisor = pic::pit_divisor();
+    if divisor > 0 {
+        let delta = (prev as u32 + divisor - c as u32) % divisor;
+        ELAPSED_PIT.fetch_add(delta as u64, Ordering::Relaxed);
+    }
+
+    // 重装（计数值往上跳）除了记账，还当"周期闹钟"用来看 IRQ0 死活
+    if c <= prev {
+        return;
+    }
+
+    if FALLBACK.load(Ordering::Relaxed) {
+        // 已接管：累计时钟 ÷ 每滴答时钟数 = 现在应该是第几拍。
+        // 用 fetch_max 而不是 fetch_add：万一 IRQ0 哪天复活了（比如
+        // 将来按 C 把线接回去），中断和轮询同时动 TICKS，累加会双倍速，
+        // 取最大值永远只跟真实时间走
+        let elapsed = ELAPSED_PIT.load(Ordering::Relaxed);
+        let want = elapsed / divisor as u64;
+        let old = TICKS.fetch_max(want, Ordering::Relaxed);
+        if want > old {
+            announce_tick(want);
+        }
+        return;
+    }
+
+    // 还没接管：留意 IRQ0 是不是死了
+    let t = TICKS.load(Ordering::Relaxed);
+    let last = TICKS_LAST_WRAP.swap(t, Ordering::Relaxed);
+    if t == last {
+        let stalls = STALLS.fetch_add(1, Ordering::Relaxed);
+        // 连续两个周期（20ms）没等到一个滴答：IRQ0 死了，接管。
+        // 阈值取 2 而不是 1：开机头一个周期里中断可能还没赶到，
+        // 误判会让 QEMU 上的正常机器双倍速
+        if stalls + 1 >= 2 {
+            FALLBACK.store(true, Ordering::Relaxed);
+            serial::print("[timer] IRQ0 dead, poll fallback took over\n");
+            console::print("timer: IRQ0 dead, polling PIT\n");
+        }
+    } else {
+        STALLS.store(0, Ordering::Relaxed);
+    }
+}
+
+/// 备用心跳接管了吗（诊断行用）
+pub fn using_fallback() -> bool {
+    FALLBACK.load(Ordering::Relaxed)
 }
 
 /// 键盘处理函数：读扫描码翻译上屏，交回执

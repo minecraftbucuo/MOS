@@ -1,9 +1,11 @@
 //! 内核贪吃蛇（番外篇）。状态与逻辑全在本模块，不碰其他子系统的行为。
 //!
 //! 结构是所有游戏循环的通形，也是 09 章调度器的雏形：
-//!   时钟中断 → 只数节拍
+//!   时钟中断 → 只数节拍（真机上中断死了由主循环轮询 PIT 顶上，
+//!              见 interrupts::poll_pit_fallback——真机时钟悬案）
 //!   键盘中断 → 只收按键
-//!   主循环   → 每个 hlt 醒来调一次 on_tick，到步点才走棋
+//!   主循环   → 每轮询一次调 poll_pit_fallback，滴答变了才调 on_tick，
+//!              到步点走棋
 //! update/draw 都在主循环里干，中断里绝不跑游戏逻辑——中断要短。
 //!
 //! 渲染用双缓冲：画面先画进屏外的一块内存（后备缓冲，堆上分配），
@@ -12,8 +14,10 @@
 
 use crate::console;
 use crate::font::{GLYPHS, GLYPH_HEIGHT, GLYPH_WIDTH};
+use crate::acpi;
 use crate::interrupts;
 use crate::keyboard;
+use crate::pic;
 use crate::sync::Shared;
 use alloc::alloc::alloc;
 use alloc::vec::Vec;
@@ -110,6 +114,39 @@ impl Game {
         line[..6].copy_from_slice(b"SCORE ");
         let digits = fmt_num(self.score, &mut line[6..]);
         self.text(8, 8, &line[..6 + digits], TEXT_COLOR, BG_COLOR);
+
+        // 诊断行（真机时钟案的证据面板，每按一次键刷新）：
+        //   T=  开机秒数（100 滴答 = 1 秒）。不动 = 时钟中断没来过
+        //   P±  PIT 芯片活体检测：+ 在数数，- 被固件停了
+        //   M   PIC 掩码里 IRQ0 是否被挡（1 = 被挡，但我们明明放行过）
+        //   I=  主 PIC 的 IRR，正在排队的中断列表。bit0 亮 = IRQ0 在敲门
+        //       而没人应；一直 00 = 门铃线压根没接上
+        //   L   HPET legacy replacement 位：1 = 开着（IRQ0 线被掐的元凶），
+        //       0 = 关，- = 这机器没有 HPET 表
+        let hex = b"0123456789ABCDEF";
+        let irr = pic::master_irr();
+        let mut s = [0u8; 24];
+        s[..2].copy_from_slice(b"T=");
+        let mut w = 2 + fmt_num((interrupts::ticks() / 100) as usize, &mut s[2..]);
+        s[w] = b' ';
+        s[w + 1] = b'P';
+        s[w + 2] = if pic::pit_ok() { b'+' } else { b'-' };
+        s[w + 3] = b' ';
+        s[w + 4] = b'M';
+        s[w + 5] = if pic::irq0_masked() { b'1' } else { b'0' };
+        s[w + 6] = b' ';
+        s[w + 7] = b'I';
+        s[w + 8] = b'=';
+        s[w + 9] = hex[(irr >> 4) as usize];
+        s[w + 10] = hex[(irr & 0xF) as usize];
+        s[w + 11] = b' ';
+        s[w + 12] = b'L';
+        s[w + 13] = match acpi::legacy_route() {
+            Some(true) => b'1',
+            Some(false) => b'0',
+            None => b'-',
+        };
+        self.text(8, 28, &s[..w + 14], DIM_COLOR, BG_COLOR);
     }
 
     /// 把食物放到随机格子（避开蛇身占着的格子），画进缓冲
@@ -267,6 +304,11 @@ pub fn on_tick(t: u64) {
             b'a' => set_dir(-1, 0),
             b'd' => set_dir(1, 0),
             b' ' => restart = true,
+            // 诊断键（真机时钟案，自愿使用）：H 沿 ACPI 指针链找 HPET、
+            // 上屏路标；C 在 L=1 时清 legacy replacement 位，试着把
+            // IRQ0 线接回去。不碰这两个键 = 这些代码从未运行
+            b'h' => acpi::probe(),
+            b'c' => acpi::try_clear(),
             _ => {}
         }
     }
@@ -302,7 +344,11 @@ pub fn init() {
     // 后备缓冲：整块屏外画布，从堆里要（堆此刻已扩到 4MB+）
     let buf = unsafe { alloc(Layout::from_size_align(size, 4096).unwrap()) };
     if buf.is_null() {
-        return; // 堆不够用就不开局——不该发生，但别拿空指针画画
+        // 画布跟屏幕一样大，屏幕越大要得越多——真机 2.5K 屏的画布 16MB，
+        // 堆开小了这一步就失败。上屏报错，绝不无声无息地不开局
+        //（这次的教训：静默失败最难查，屏幕停在启动文字上像冻住一样）
+        console::print("game: canvas alloc FAILED!\n");
+        return;
     }
 
     let mut g = Game {
