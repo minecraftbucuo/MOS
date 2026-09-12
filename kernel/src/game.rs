@@ -290,8 +290,14 @@ pub fn on_tick(t: u64) {
 /// 开局：要画布、建状态、reset 摆好第一帧。console 就绪后调一次
 pub fn init() {
     let (w, h) = console::pixel_size();
-    let (cols, rows) = (w / CELL, h / CELL);
     let (pitch, size) = console::canvas();
+    if w == 0 || h == 0 || size == 0 {
+        // 没有屏幕（个别真机固件给 Limine 的 framebuffer 请求吃闭门羹）。
+        // 此时 cols/rows 会是 0，place_food 里 % self.cols 就是除以零——
+        // 不开局，让屏幕保持引导器留下的样子，别无声无息地挂死
+        return;
+    }
+    let (cols, rows) = (w / CELL, h / CELL);
 
     // 后备缓冲：整块屏外画布，从堆里要（堆此刻已扩到 4MB+）
     let buf = unsafe { alloc(Layout::from_size_align(size, 4096).unwrap()) };
