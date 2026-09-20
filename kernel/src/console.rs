@@ -65,12 +65,21 @@ impl Console {
         }
     }
 
-    /// 双缓冲翻页：把后备缓冲整块拷进显存。
-    /// 画面先画在屏外缓冲里，画完一次拷贝上屏——显示刷新要么看到
-    /// 旧帧、要么看到新帧，永远逮不到"画到一半"的中间态
-    fn blit(&self, buf: *const u8) {
+    /// 脏矩形翻页：只把 y0..y1 像素行从后备缓冲拷上屏。
+    /// y0=0、y1=height 就是整屏拷——开局摆棋、终局清屏用。
+    /// 显存不是普通内存——写它要绕道显卡，同拷 1 字节贵一个数量级。
+    /// 整屏拷 16MB 时主循环被泡在拷贝里几十上百毫秒，备用心跳
+    /// "两次轮询间隔 < 一个 PIT 周期"的前提当场击穿，时间整段整段地丢
+    ///（真机蛇慢的元凶，见 docs/番外-真机时钟悬案.md）。
+    /// 而每步棋其实只动蛇头、蛇尾、HUD 那几十行——只拷变化的行
+    fn blit_rows(&self, buf: *const u8, y0: usize, y1: usize) {
+        let start = y0 * self.pitch;
         unsafe {
-            core::ptr::copy_nonoverlapping(buf, self.base, self.pitch * self.height);
+            core::ptr::copy_nonoverlapping(
+                buf.add(start),
+                self.base.add(start),
+                (y1 - y0) * self.pitch,
+            );
         }
     }
 
@@ -212,9 +221,11 @@ pub fn canvas() -> (usize, usize) {
     }
 }
 
-/// 全局：双缓冲翻页——后备缓冲整块拷上屏
-pub fn blit(buf: *const u8) {
+/// 全局：双缓冲翻页——把后备缓冲的 y0..y1 像素行拷上屏。
+/// y0=0、y1=屏幕高 = 整屏；游戏走棋只拷变化的行（脏矩形），
+/// 拷得少、主循环被拖住的时间就短
+pub fn blit_rows(buf: *const u8, y0: usize, y1: usize) {
     if let Some(con) = CONSOLE.get() {
-        con.blit(buf);
+        con.blit_rows(buf, y0, y1);
     }
 }

@@ -73,6 +73,20 @@ pub fn init_timer(hz: u32) {
     DIVISOR.store(divisor, Ordering::Relaxed);
 }
 
+/// 备用心跳的量程扩容：把除数拉满 65536，周期从 10ms 放宽到 ~54.9ms。
+/// 记时间法的前提是"两次轮询间隔 < 一个周期"——主循环一旦被拖住超过
+/// 一个周期（慢显存整屏拷贝、SMM 把 CPU 叫走），PIT 已经转了一圈以上，
+/// 而读数看不出转了几圈，多转的时间整段丢失。放宽周期 = 给轮询留出
+/// 宽裕量程：55ms 以内的停顿都能全额记上账。只在轮询接管时调用一次
+pub fn widen_pit_period() {
+    outb(0x43, 0x34);
+    // 除数用 65535 而不是 0：0 按规范也代表 65536，但这是个借位表示，
+    // 走 65535 避开"写 0"的边界行为，周期 54.92ms vs 54.93ms 无所谓
+    outb(0x40, 0xFF);
+    outb(0x40, 0xFF);
+    DIVISOR.store(65535, Ordering::Relaxed);
+}
+
 /// 每个滴答对应多少个 PIT 输入时钟（1193182 / 频率）
 pub fn pit_divisor() -> u32 {
     DIVISOR.load(Ordering::Relaxed)

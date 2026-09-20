@@ -219,13 +219,16 @@ pub fn init(resp: &MemmapResponse, hhdm_offset: u64) -> bool {
 }
 
 /// 物理区间 [phys, phys+len) 是否落在清单里的 RAM 类区段内。
-/// RAM 类：0=usable、2=ACPI 可回收、3=ACPI NVS、5=bootloader 可回收——
-/// ACPI 表就住在 2/3 类里。RAM 之外的区段（reserved/MMIO 洞）
-/// 不保证被 Limine 映射过，读了可能缺页
+/// RAM 类：0=usable、1=reserved、2=ACPI 可回收、3=ACPI NVS、
+/// 5=bootloader 可回收。reserved 也是真内存——固件只是"留着自用"
+/// 没交出来，读它不会缺页。真机固件爱把 RSDP 放在 reserved 区
+///（QEMU/OVMF 放 2 类，所以这坑只在真机炸：时钟案第六幕，A0 的
+/// 头号嫌疑——第一版只认 0|2|3|5，真机探测死在第一道护栏）。
+/// 真正危险的 MMIO 洞一般**根本不在清单里**，照样进不来
 pub fn in_ram(phys: u64, len: u64) -> bool {
     let m = REGION_MAP.get();
     m.regions[..m.count].iter().any(|r| {
-        matches!(r.kind, 0 | 2 | 3 | 5) && phys >= r.base && phys + len <= r.base + r.len
+        matches!(r.kind, 0 | 1 | 2 | 3 | 5) && phys >= r.base && phys + len <= r.base + r.len
     })
 }
 

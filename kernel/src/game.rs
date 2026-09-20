@@ -20,6 +20,7 @@ use crate::keyboard;
 use crate::pic;
 use crate::sync::Shared;
 use alloc::alloc::alloc;
+use alloc::vec; // vec! 宏（和 Vec 类型是两个名字空间）
 use alloc::vec::Vec;
 use core::alloc::Layout;
 
@@ -57,9 +58,60 @@ struct Game {
     buf: *mut u8,   // 后备缓冲：屏外画布（堆上的一整块）
     pitch: usize,   // 画布行距（字节），与显存一致
     size: usize,    // 画布总字节数（整屏涂黑用）
+    /// 每像素行一面"画过还没上屏"的旗。不能只记一个 [最小行,最大行] 的
+    /// 脏带：HUD 在屏顶、蛇在屏中间，一条带能把大半个屏圈进去，
+    /// 白拷几 MB。逐行记，翻页时把连续的脏行段一小段一小段地拷
+    dirty: Vec<bool>,
+    /// 下一个步点在哪一拍。判步点不能用 t % STEP_INTERVAL == 0 的
+    /// 等值判断：轮询接管后滴答不是一拍一拍地涨（一次同步可能跨过
+    /// 好几个步点），等值会整段漏拍——真机蛇慢成 1/5 的元凶
+    ///（时钟案第四幕）。改成"到了就走"，跨过去的步点不补、按新节拍走
+    next_step: u64,
+    /// 自愈翻页的计数器（见 tick 末尾）
+    heal: u16,
+    /// 自愈翻页还开着吗。第一次自愈时用 HPET 钟掐表：整屏重抄超过
+    /// 一个滴答（10ms）= 慢显存的真机，永久关闭；没有 HPET 钟可掐
+    /// 同样不敢盲抄，也关
+    heal_on: bool,
 }
 
 impl Game {
+    /// 登记一行"画过但还没上屏"。显存写得越少，主循环被拷贝拖住的
+    /// 时间越短——拖过一个 PIT 周期，轮询的时间账就整段漏掉
+    ///（真机时钟案第三幕，详见 docs/番外-真机时钟悬案.md）
+    fn mark(&mut self, y: usize) {
+        if y < self.dirty.len() {
+            self.dirty[y] = true;
+        }
+    }
+
+    /// 登记整屏（终局清屏、重开摆棋——这两场是"真整屏都变了"）
+    fn mark_all(&mut self) {
+        for f in self.dirty.iter_mut() {
+            *f = true;
+        }
+    }
+
+    /// 把登记过的行拷上屏，登记清零。连续的脏行拼成段，
+    /// 一段调一次 blit_rows——蛇头、蛇尾、HUD 各一小段
+    fn blit_dirty(&mut self) {
+        let rows = self.dirty.len();
+        let mut run: Option<usize> = None; // 当前脏段的首行
+        for y in 0..rows {
+            if self.dirty[y] {
+                if run.is_none() {
+                    run = Some(y);
+                }
+                self.dirty[y] = false;
+            } else if let Some(s) = run.take() {
+                console::blit_rows(self.buf, s, y);
+            }
+        }
+        if let Some(s) = run {
+            console::blit_rows(self.buf, s, rows);
+        }
+    }
+
     /// 线性同余生成器（LCG）：一次乘法一次加法，输出"看着像随机"的数。
     /// 裸机没有现成随机源，拿开机以来的滴答数当种子——每次开机都不同
     fn next_rand(&mut self) -> u64 {
@@ -71,8 +123,13 @@ impl Game {
     }
 
     /// 把一个格子画进后备缓冲
-    fn paint(&self, col: usize, row: usize, color: u32) {
+    fn paint(&mut self, col: usize, row: usize, color: u32) {
         for yy in 0..CELL {
+            // 16 行像素**每行都要登记**。曾经只标首尾两行——那是"一条
+            // [lo,hi) 脏带"时代的写法（标两端=标出整条带），改成逐行
+            // 旗标后照搬，中间 14 行就永远留在屏幕上：蛇变成两条移动
+            // 的边线、旧身体成幻影、食物吃不掉
+            self.mark(row * CELL + yy);
             // 一行的起点 = 基址 + 像素行 × 行距 + 格子左边缘
             let row_base = (row * CELL + yy) * self.pitch + col * CELL * 4;
             for xx in 0..CELL {
@@ -85,7 +142,8 @@ impl Game {
     }
 
     /// 把一个像素画进后备缓冲
-    fn px(&self, x: usize, y: usize, color: u32) {
+    fn px(&mut self, x: usize, y: usize, color: u32) {
+        self.mark(y);
         unsafe {
             let p = self.buf.add(y * self.pitch + x * 4) as *mut u32;
             p.write_volatile(color);
@@ -94,7 +152,7 @@ impl Game {
 
     /// 把一行 ASCII 文字画进后备缓冲（逐字取字模，亮点描 fg、暗点描 bg）。
     /// col_px/row_px 是像素坐标。font.rs 的字模表本来就是公开的，直接取用
-    fn text(&self, col_px: usize, row_px: usize, s: &[u8], fg: u32, bg: u32) {
+    fn text(&mut self, col_px: usize, row_px: usize, s: &[u8], fg: u32, bg: u32) {
         for (i, &b) in s.iter().enumerate() {
             let glyph = &GLYPHS[b as usize];
             let x0 = col_px + i * GLYPH_WIDTH;
@@ -109,7 +167,7 @@ impl Game {
 
     /// 左上角的分数 HUD。每步都重画——蛇从它底下钻过时，
     /// 文字永远压在蛇上面，画面不会花
-    fn paint_score(&self) {
+    fn paint_score(&mut self) {
         let mut line = [0u8; 6 + 20];
         line[..6].copy_from_slice(b"SCORE ");
         let digits = fmt_num(self.score, &mut line[6..]);
@@ -125,9 +183,9 @@ impl Game {
         //       0 = 关，- = 这机器没有 HPET 表
         let hex = b"0123456789ABCDEF";
         let irr = pic::master_irr();
-        let mut s = [0u8; 24];
+        let mut s = [0u8; 48];
         s[..2].copy_from_slice(b"T=");
-        let mut w = 2 + fmt_num((interrupts::ticks() / 100) as usize, &mut s[2..]);
+        let w = 2 + fmt_num((interrupts::ticks() / 100) as usize, &mut s[2..]);
         s[w] = b' ';
         s[w + 1] = b'P';
         s[w + 2] = if pic::pit_ok() { b'+' } else { b'-' };
@@ -146,7 +204,28 @@ impl Game {
             Some(false) => b'0',
             None => b'-',
         };
-        self.text(8, 28, &s[..w + 14], DIM_COLOR, BG_COLOR);
+        // A：时间账本记在哪座钟上（第五幕起不用 PIT 记账）。
+        // H = HPET 主计数器，P = ACPI PM 定时器（备胎钟），
+        // - = 两座都没有，退回 PIT/中断
+        s[w + 14] = b' ';
+        s[w + 15] = b'A';
+        s[w + 16] = if acpi::hpet_now().is_some() {
+            b'H'
+        } else if acpi::pm_clock().is_some() {
+            b'P'
+        } else {
+            b'-'
+        };
+        // F：轮询备用心跳接管了吗。接管时上屏的那句 "polling PIT"
+        // 一闪就被游戏画面盖掉，留个常驻旗标随时可查
+        s[w + 17] = b' ';
+        s[w + 18] = b'F';
+        s[w + 19] = if interrupts::using_fallback() { b'1' } else { b'0' };
+        // 构建标记：真机上核对 U 盘镜像新旧用——看不到 B7 = 烧的是旧版
+        s[w + 20] = b' ';
+        s[w + 21] = b'B';
+        s[w + 22] = b'7';
+        self.text(8, 28, &s[..w + 23], DIM_COLOR, BG_COLOR);
     }
 
     /// 把食物放到随机格子（避开蛇身占着的格子），画进缓冲
@@ -194,13 +273,45 @@ impl Game {
             self.place_food();
         }
         self.paint_score();
-        console::blit(self.buf);
+        // 自愈翻页：QEMU 这类模拟显示只重画"看到过写入"的行——拷贝
+        // 撞上它刷新的瞬间，那一行就定格在半截旧内容上（蛇走过的
+        // 细绿线就是它）。旧版整屏翻页每步全量重写，撞了下一步也盖
+        // 掉了；脏矩形只写小段，被撞的行没人再写，旧像素永远留着。
+        // 每 10 步（约 1 秒）把整屏登记重抄一遍，把可能的陈旧行抹平。
+        // 真机上不该抄：真显示每帧都重读显存本来就自愈，16MB 重抄
+        // 反而把主循环拖过时钟周期，旧病复发。判据不再是"轮询是否
+        // 接管"（那是 PIT 时代的代理指标），而是直接掐表：用 HPET 钟
+        // 量这次重抄花的时间，超过一个滴答（10ms）= 慢显存，永久关闭
+        self.heal += 1;
+        if self.heal >= 10 {
+            self.heal = 0;
+            if self.heal_on {
+                if let Some(t0) = acpi::hpet_now() {
+                    self.mark_all();
+                    self.blit_dirty();
+                    // 抄完掐表收工。慢于一个滴答 = 真机慢显存，今后不再抄；
+                    // QEMU 的"显存"就是内存，整屏几毫秒内抄完，自愈保留
+                    if let Some(per_tick) = acpi::hpet_per_tick() {
+                        let dt = acpi::hpet_now().map_or(0, |t1| t1.wrapping_sub(t0));
+                        if dt > per_tick {
+                            self.heal_on = false;
+                        }
+                    }
+                    return; // 整屏刚上屏，这一步不用再翻页
+                }
+                // 没有 HPET 钟可掐 = 不知道这台机器抄屏多快，不敢赌，
+                // 自愈关闭（脏矩形路径本身不受影响）
+                self.heal_on = false;
+            }
+        }
+        self.blit_dirty();
     }
 
     /// 终局画面：清屏、居中三行字、翻页。此后 tick 不再走，等空格重开
     fn game_over(&mut self) {
         self.phase = Phase::Over;
         unsafe { core::ptr::write_bytes(self.buf, 0, self.size) };
+        self.mark_all();
 
         let cx = self.cols * CELL / 2; // 屏幕中心的像素坐标
         let cy = self.rows * CELL / 2;
@@ -221,7 +332,7 @@ impl Game {
             DIM_COLOR,
             BG_COLOR,
         );
-        console::blit(self.buf);
+        self.blit_dirty();
     }
 
     /// 原地重开：重置状态、重画第一帧。注意不能重新 init——
@@ -235,13 +346,19 @@ impl Game {
         self.dir = (1, 0);
         self.score = 0;
         self.phase = Phase::Play;
+        self.next_step = 0; // 重开后立刻起步（到点就走的写法下 0 永远"到点"）
+        self.heal = 0;
         unsafe { core::ptr::write_bytes(self.buf, 0, self.size) };
-        for &(x, yy) in &self.body {
+        self.mark_all();
+        // 用索引取坐标（Copy 出来借用当场结束）——直接 for &x in &self.body
+        // 的话，遍历借着 body 不放，paint 的 &mut self 就进不来
+        for i in 0..self.body.len() {
+            let (x, yy) = self.body[i];
             self.paint(x, yy, SNAKE_COLOR);
         }
         self.place_food();
         self.paint_score();
-        console::blit(self.buf);
+        self.blit_dirty();
     }
 }
 
@@ -321,7 +438,12 @@ pub fn on_tick(t: u64) {
                 }
             }
             Phase::Play => {
-                if t % STEP_INTERVAL == 0 {
+                // 到点就走。等值判断（t % STEP_INTERVAL == 0）只对
+                // "滴答一拍一拍涨"成立——中断正常时是这样，轮询接管后
+                // 一次同步可能跨过好几个步点，等值会漏拍。跨过的步点
+                // 不补走（补会连跳几下），从当前拍重新数节拍
+                if t >= g.next_step {
+                    g.next_step = t + STEP_INTERVAL;
                     g.tick();
                 }
             }
@@ -363,6 +485,10 @@ pub fn init() {
         buf,
         pitch,
         size,
+        dirty: vec![false; h],
+        next_step: 0,
+        heal: 0,
+        heal_on: true,
     };
     g.reset(); // 摆初始蛇、放食物、第一帧上屏，全在 reset 里
     *GAME.get() = Some(g);

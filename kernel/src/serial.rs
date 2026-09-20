@@ -35,6 +35,21 @@ pub fn inb(port: u16) -> u8 {
     value
 }
 
+/// 从 IO 端口读 32 位（时钟案第六幕：读 ACPI PM 定时器，它的计数器
+/// 是一个 4 字节宽的 IO 端口）。端口读永不缺页——最坏读到 0xFF，
+/// 这是 IO 端口比 MMIO 温柔的地方
+pub fn inl(port: u16) -> u32 {
+    let value: u32;
+    unsafe {
+        asm!("in eax, dx",
+            out("eax") value,
+            in("dx") port,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    value
+}
+
 /// 一个串口。base 是它的端口基址（COM1 = 0x3F8）
 pub struct SerialPort {
     base: u16,
