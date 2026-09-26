@@ -1,61 +1,163 @@
-//! 内核堆（第一版）：bump allocator。对应教程：docs/08-4-内核堆.md
+//! 内核堆（第二版）：空闲链表分配器。对应教程：docs/08-6-内核堆v2.md
 //!
-//! 页帧分配器（mm.rs）只按整页 4KB 分配；堆垫在它上面，
-//! 按任意字节数分配、随时归还。
+//! 每块内存前有 16 字节头部记录本块大小；空闲块串成按地址排序的链；
+//! 分配走首次适配并切块，归还挂链并合并相邻空闲块。
+//! 并发保护：所有操作包在 without_interrupts 里。
 //!
-//! bump 分配：游标只往上移，分配 = 游标前移。
-//! 代价是 free 不回收内存——第一版的诚实缺陷，以后换真正的分配器。
+//! 对齐处理：返回地址先向上对齐到 align，头部放在返回地址前面
+//! 16 字节。align ≤ 16 时头部恰好落在块的原起点；align > 16 时
+//! 头部之前会垫出一段对齐缝隙，成为不可复用的空洞（每个对齐分配
+//! 最多损失 align-16 字节）——大对齐请求（如画布的 4096 对齐）
+//! 整个生命周期只发生几次，代价可忽略。
 
 use crate::mm;
+use crate::sync;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-// 三个原子量 = 堆的全部状态。0 表示还没建堆
-static START: AtomicUsize = AtomicUsize::new(0); // 堆底（虚拟地址）
-static SIZE: AtomicUsize = AtomicUsize::new(0); // 总大小（字节）
-static TOP: AtomicUsize = AtomicUsize::new(0); // 游标：已用到的偏移
+const HDR: usize = 16; // 头部大小
+const MIN_BLOCK: usize = 32; // 最小块 = 头部 + 16B 载荷
 
-/// 建堆：向页帧分配器要一段连续的 pages 页。
-/// 返回 false = 找不到这么长的连续空闲段
-///（bump 堆靠 HHDM 直映射用内存，物理连续才在虚拟地址上连成一块）
+/// 头部。已分配块：只有 size 有意义；空闲块：还挂在链上，next 生效
+#[repr(C)]
+struct Header {
+    size: usize,       // 本块总字节数（含头部），恒为 16 的倍数
+    next: *mut Header, // 空闲链上的下一块
+}
+
+static START: AtomicUsize = AtomicUsize::new(0);
+static SIZE: AtomicUsize = AtomicUsize::new(0);
+static FREE_HEAD: AtomicUsize = AtomicUsize::new(0); // 链头，0 = 空链
+
+/// 向上取整到 a 的倍数（取整载荷、对齐返回地址用的是同一个运算）
+fn align_up(x: usize, a: usize) -> usize {
+    (x + a - 1) & !(a - 1)
+}
+
 pub fn init(pages: u64) -> bool {
     let first = match mm::alloc_frame_contig(pages) {
         Some(p) => p,
         None => return false,
     };
+    let start = mm::phys_to_virt(first) as usize;
+    let size = (pages * mm::PAGE_SIZE) as usize;
+    START.store(start, Ordering::Relaxed);
+    SIZE.store(size, Ordering::Relaxed);
 
-    START.store(mm::phys_to_virt(first) as usize, Ordering::Relaxed);
-    SIZE.store((pages * mm::PAGE_SIZE) as usize, Ordering::Relaxed);
-    TOP.store(0, Ordering::Relaxed);
+    // 链上只有一块：整堆
+    unsafe {
+        (*(start as *mut Header)).size = size;
+        (*(start as *mut Header)).next = core::ptr::null_mut();
+    }
+    FREE_HEAD.store(start, Ordering::Relaxed);
     true
 }
 
-/// 分配 len 字节、按 align 对齐。堆满返回 None
-///
-/// 注：load/store 不是原子读改写，这里默认"单核、且中断处理函数
-/// 不碰堆"；真正要并发安全时（多核），这里得换成 CAS 循环
+/// 分配 len 字节、按 align 对齐。堆里找不到就返回 None
 pub fn alloc(len: usize, align: usize) -> Option<*mut u8> {
-    let start = START.load(Ordering::Relaxed);
-    if start == 0 {
-        return None; // 堆还没建
-    }
-    let size = SIZE.load(Ordering::Relaxed);
-    let mut top = TOP.load(Ordering::Relaxed);
+    let len = len.max(1);
+    sync::without_interrupts(|| {
+        let r = align_up(len, 16); // 载荷按 16 取整
 
-    // 对齐：游标不够齐就垫高到 align 的倍数（垫的缝隙白送，不记账）
-    top = (top + align - 1) & !(align - 1);
-    if top + len > size {
-        return None; // 堆满。bump 堆不回收，满 = 完
-    }
-    TOP.store(top + len, Ordering::Relaxed);
-    Some((start + top) as *mut u8)
+        let mut prev: *mut Header = core::ptr::null_mut();
+        let mut cur = FREE_HEAD.load(Ordering::Relaxed) as *mut Header;
+        while !cur.is_null() {
+            let base = cur as usize;
+            let cur_end = base + unsafe { (*cur).size };
+            // 返回地址向上对齐；头部在返回地址前面 16 字节
+            let payload = align_up(base + HDR, align);
+            let header = payload - HDR;
+            let end = payload + r;
+
+            if end <= cur_end {
+                // 这块放得下。剩余够构成完整块就切块，否则整段吃下
+                if cur_end - end >= MIN_BLOCK {
+                    let rest = end as *mut Header;
+                    unsafe {
+                        (*rest).size = cur_end - end;
+                        (*rest).next = (*cur).next; // rest 顶替 cur 的链位
+                    }
+                    if prev.is_null() {
+                        FREE_HEAD.store(rest as usize, Ordering::Relaxed);
+                    } else {
+                        unsafe { (*prev).next = rest; }
+                    }
+                } else {
+                    // 剩余不足以自立成块，并进本次分配（头部按延伸后的大小记）
+                    if prev.is_null() {
+                        unsafe { FREE_HEAD.store((*cur).next as usize, Ordering::Relaxed); }
+                    } else {
+                        unsafe { (*prev).next = (*cur).next; }
+                    }
+                    unsafe { (*(header as *mut Header)).size = cur_end - header; }
+                    return Some(payload as *mut u8);
+                }
+                unsafe { (*(header as *mut Header)).size = end - header; }
+                return Some(payload as *mut u8);
+            }
+            prev = cur;
+            cur = unsafe { (*cur).next };
+        }
+        None // 扫完整条链：确实没有可满足的空间
+    })
 }
 
-/// 归还。bump 版：什么都不做（下轮接 GlobalAlloc 时它必须在场）
-pub fn dealloc(_ptr: *mut u8) {}
+/// 归还。从头部恢复块大小，按地址顺序挂回链上，并合并相邻空闲块
+pub fn dealloc(ptr: *mut u8) {
+    if ptr.is_null() {
+        return;
+    }
+    sync::without_interrupts(|| {
+        let mut block = (ptr as usize - HDR) as *mut Header;
+        let size = unsafe { (*block).size };
 
-// ---------- 接入 Rust 分配世界 ----------
-// Box/Vec 不自己分配，全走 GlobalAlloc 这扇门；
-// 我们把门后的活指给上面的 bump 堆
+        // 按地址顺序找插入点（prev/next 是物理上的左右邻居；
+        // 对齐缝隙会造成"隔空邻居"，合并条件不满足就自然跳过）
+        let mut prev: *mut Header = core::ptr::null_mut();
+        let mut cur = FREE_HEAD.load(Ordering::Relaxed) as *mut Header;
+        while !cur.is_null() && (cur as usize) < (block as usize) {
+            prev = cur;
+            cur = unsafe { (*cur).next };
+        }
+
+        unsafe {
+            // 先挂上链
+            if prev.is_null() {
+                FREE_HEAD.store(block as usize, Ordering::Relaxed);
+            } else {
+                (*prev).next = block;
+            }
+            (*block).next = cur;
+
+            // 合并前邻：prev 的末尾正好接上本块的开头
+            if !prev.is_null() && (prev as usize) + (*prev).size == block as usize {
+                (*prev).size += size;
+                (*prev).next = (*block).next;
+                block = prev; // 合并后的块以 prev 为代表
+            }
+            // 合并后邻：本块的末尾正好接上 cur 的开头
+            if (block as usize) + (*block).size == cur as usize {
+                (*block).size += (*cur).size;
+                (*block).next = (*cur).next;
+            }
+        }
+    })
+}
+
+/// (空闲总量, 空闲块数)。分配/归还应当守恒——验证全靠它
+pub fn stats() -> (usize, usize) {
+    let mut total = 0;
+    let mut count = 0;
+    let mut cur = FREE_HEAD.load(Ordering::Relaxed) as *mut Header;
+    while !cur.is_null() {
+        total += unsafe { (*cur).size - HDR }; // 头部不计入空闲量
+        count += 1;
+        cur = unsafe { (*cur).next };
+    }
+    (total, count)
+}
+
+// ---------- 接入 Rust 分配接口 ----------
+// Box/Vec 统一走 GlobalAlloc 接口，我们把接口的请求转给上面的堆
 
 use core::alloc::{GlobalAlloc, Layout};
 
@@ -63,10 +165,10 @@ use core::alloc::{GlobalAlloc, Layout};
 struct KernelHeap;
 
 // unsafe：编译器对这里的实现零审查、全盘信任——
-// 返回的指针不对齐/重叠，上层 UB，全是我们兜
+// 返回的指针对齐/重叠是否正确，全由实现者负责
 unsafe impl GlobalAlloc for KernelHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // 协议翻译：trait 要"失败 = 空指针"，我们的堆说 Option
+        // 约定转换：接口要求"失败 = 空指针"，我们的堆返回 Option
         match alloc(layout.size(), layout.align()) {
             Some(ptr) => ptr,
             None => core::ptr::null_mut(),

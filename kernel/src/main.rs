@@ -221,6 +221,32 @@ pub extern "C" fn kmain() -> ! {
                         // 作用域结束：Drop 自动调 dealloc（bump 堆不回收，没有实际效果）
                         console::print("heap: boxvec ok\n");
                         console::print("heap up\n");
+
+                        // 08-6：堆自检——借还守恒律。
+                        // 反复借还 1000 次各种尺寸，空闲总量必须分毫不差回来。
+                        // 一条检查同时抓三类错：归还丢失（总量变少）、
+                        // 切块做错（块数异常）、合并做错（块数/总量异常）。
+                        // 指针存栈上定长数组——若存 Vec，Vec 自己的缓冲
+                        // 会在测量时活着，污染守恒检查
+                        let (free0, _) = heap::stats();
+                        let mut ptrs = [core::ptr::null_mut::<u8>(); 1000];
+                        for (i, slot) in ptrs.iter_mut().enumerate() {
+                            let n = 8 + (i * 37) % 512;
+                            *slot = heap::alloc(n, 16).expect("heap selftest: alloc failed");
+                        }
+                        for p in ptrs.iter() {
+                            heap::dealloc(*p);
+                        }
+                        let (free1, blocks) = heap::stats();
+                        let msg = alloc::format!(
+                            "heap selftest: {} blocks, free {} -> {} {}\n",
+                            blocks,
+                            free0,
+                            free1,
+                            if free1 == free0 { "PASS" } else { "FAIL!" }
+                        );
+                        console::print(&msg);
+                        serial::print(&msg);
                     } else {
                         serial::print("heap init failed!\n");
                         console::print("heap init FAILED!\n");
